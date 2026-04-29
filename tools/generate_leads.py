@@ -526,13 +526,10 @@ def fetch_vibe_leads(
     }
     log(f"[vpai] {region}: enriching {len(prospect_ids[:100])} prospects for contact details")
     enrich_result = _vpai("enrich-prospects", enrich_args)
-    log(f"[vpai] {region}: enrich top-level keys: {list(enrich_result.keys())[:10]}")
-    er = enrich_result.get("enrichment_results", {})
-    log(f"[vpai] {region}: enrichment_results type={type(er).__name__} keys={list(er.keys())[:10] if isinstance(er, dict) else 'n/a'}")
-    contacts_raw = er.get("contacts", "") if isinstance(er, dict) else ""
-    log(f"[vpai] {region}: contacts field type={type(contacts_raw).__name__} len={len(str(contacts_raw))}")
-    if contacts_raw:
-        log(f"[vpai] {region}: contacts preview: {str(contacts_raw)[:200]}")
+    # Detect plain-text error messages returned inside the contacts field
+    contacts_raw = enrich_result.get("enrichment_results", {}).get("contacts", "")
+    if isinstance(contacts_raw, str) and contacts_raw and not contacts_raw.strip().startswith("{"):
+        log(f"[vpai] {region}: enrich returned an error — {contacts_raw[:300]}")
     contact_map = _parse_enrich_contacts(enrich_result)
     log(f"[vpai] {region}: got contact data for {len(contact_map)} prospects")
 
