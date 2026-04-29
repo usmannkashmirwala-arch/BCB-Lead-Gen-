@@ -186,10 +186,46 @@ def generate_note(lead: dict, icp_text: str) -> str:
 
 # ── Google Sheets auth ────────────────────────────────────────────────────────
 
+def _parse_svc_account_json(raw: str) -> dict:
+    s = raw.strip()
+    # Try direct parse first
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, str):  # double-encoded
+            parsed = json.loads(parsed)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    # Strip surrounding single or double quotes added by some secret managers
+    if len(s) >= 2 and s[0] in ('"', "'") and s[-1] in ('"', "'"):
+        s = s[1:-1].strip()
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    # Last resort: extract the first {...} blob (handles extra chars like BOM)
+    match = re.search(r'\{.*\}', s, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    raise SystemExit(
+        "GOOGLE_SERVICE_ACCOUNT_JSON cannot be parsed as JSON. "
+        "In GitHub → Settings → Secrets, paste only the raw JSON object "
+        "with no surrounding quotes."
+    )
+
+
 def get_sheets_client():
     svc_json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if svc_json_str:
-        return gspread.service_account_from_dict(json.loads(svc_json_str))
+        return gspread.service_account_from_dict(_parse_svc_account_json(svc_json_str))
     return gspread.service_account(filename="credentials.json")
 
 
