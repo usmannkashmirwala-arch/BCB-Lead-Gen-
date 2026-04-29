@@ -69,7 +69,7 @@ PK_QUERIES = [
 ]
 
 # ── Apollo.io config ─────────────────────────────────────────────────────────
-APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
+APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
 APOLLO_SENIORITIES = ["owner", "founder", "c_suite", "vp", "director"]
 APOLLO_INDUSTRIES = ["Apparel & Fashion", "Retail", "Consumer Goods"]
 MENA_LOCATIONS = ["United Arab Emirates", "Saudi Arabia", "Qatar", "Kuwait"]
