@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
 Daily lead generation pipeline for Better Call Bot.
-Generates 50 leads/day: 30 Pakistan (Google Maps), 10 MENA + 10 USA (Apollo.io).
+Generates 30 Pakistan leads/day via Google Maps.
+Enriches each lead with website URL and scraped business email.
 Appends to Google Sheets: DailyLeads and UsedContacts (dedup registry).
-
-ICP context is loaded at startup from Lead Details/BCB ICP and Offer.pdf
-so notes always reflect the latest ICP positioning.
 
 Usage:
     python tools/generate_leads.py           # Full run (writes to Sheets)
@@ -40,16 +38,16 @@ DAILY_LEADS_HEADERS = [
     "Company", "Industry", "EmployeeEstimate", "Country", "SupportChannel",
     "ContactName", "ContactRole", "LinkedIn", "Email", "Phone",
     "LeadSource", "FitGrade", "IntentScore", "DateAdded", "Status", "Note",
+    "Website",
 ]
 USED_CONTACTS_HEADERS = ["Region", "Identifier", "DateAdded", "LeadSource"]
 
 # ── Targets ───────────────────────────────────────────────────────────────────
 PK_TARGET = 30
-MENA_TARGET = 10
-USA_TARGET = 10
 
 # ── Pakistan query pool ───────────────────────────────────────────────────────
 PK_QUERIES = [
+    # Apparel & Fashion
     "clothing store Karachi", "apparel brand Karachi", "fashion boutique Karachi",
     "pret wear Karachi", "women clothing Karachi", "kurta brand Karachi",
     "lawn brand Karachi", "ethnic wear Karachi", "designer clothes Karachi",
@@ -57,26 +55,71 @@ PK_QUERIES = [
     "garment store Lahore", "pret wear Lahore", "fashion retailer Lahore",
     "apparel brand Lahore", "lawn brand Lahore", "women clothing Lahore",
     "clothing brand Islamabad", "fashion boutique Islamabad", "apparel store Islamabad",
-    "textile brand Faisalabad", "garment manufacturer Faisalabad", "clothing Faisalabad",
-    "fashion store Rawalpindi", "clothing store Rawalpindi",
-    "pret wear Sialkot", "garment Sialkot",
-    "fashion boutique Multan", "clothing store Multan",
-    "apparel store Gujranwala", "clothing store Gujranwala",
-    "fashion store Peshawar",
+    "textile brand Faisalabad", "garment manufacturer Faisalabad",
+    "fashion store Rawalpindi", "pret wear Sialkot",
+    "fashion boutique Multan", "apparel store Gujranwala", "fashion store Peshawar",
     "boutique Hyderabad Pakistan",
-    "apparel Bahawalpur",
-    "fashion clothing Sargodha",
+    # Footwear
+    "shoe brand Karachi", "footwear brand Karachi", "sneaker store Karachi",
+    "shoes brand Lahore", "footwear store Lahore", "sandal brand Pakistan",
+    "shoe store Islamabad", "footwear brand Faisalabad",
+    # Supplements & Health
+    "supplement brand Pakistan", "protein supplement Karachi",
+    "health supplement Lahore", "vitamin supplement Pakistan",
+    "nutrition brand Pakistan", "sports nutrition Karachi",
+    "supplement store Islamabad",
+    # Herbal & Organic
+    "herbal products Pakistan", "herbal brand Karachi",
+    "organic products Pakistan", "natural products Lahore",
+    "herbal tea brand Pakistan", "organic skincare Pakistan",
+    # Beauty & Personal Care
+    "cosmetics brand Pakistan", "skincare brand Karachi",
+    "beauty products Pakistan", "hair care brand Pakistan",
+    "makeup brand Lahore",
 ]
-
-# ── Apollo.io config ─────────────────────────────────────────────────────────
-APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
-APOLLO_SENIORITIES = ["owner", "founder", "c_suite", "vp", "director"]
-APOLLO_INDUSTRIES = ["Apparel & Fashion", "Retail", "Consumer Goods"]
-MENA_LOCATIONS = ["United Arab Emirates", "Saudi Arabia", "Qatar", "Kuwait"]
-USA_LOCATIONS = ["United States"]
 
 # ── Google Maps config ────────────────────────────────────────────────────────
 MAPS_BASE = "https://maps.googleapis.com/maps/api/place"
+
+# Platform/SaaS domains that show up in website HTML but aren't business emails
+_SKIP_EMAIL_DOMAINS = {
+    "sentry.io", "example.com", "wordpress.com", "wix.com", "wixpress.com",
+    "shopify.com", "squarespace.com", "mailchimp.com", "cloudflare.com",
+    "googletagmanager.com", "google.com", "facebook.com", "instagram.com",
+    "w3.org", "schema.org", "jquery.com",
+}
+
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+_MAILTO_RE = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})')
+
+
+def _extract_email_from_website(url: str) -> str:
+    """Scrape a business email from the website. Tries homepage then /contact."""
+    if not url:
+        return ""
+    base = url.rstrip("/")
+    pages = [base, f"{base}/contact", f"{base}/contact-us"]
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; LeadBot/1.0)"}
+
+    for page_url in pages:
+        try:
+            resp = requests.get(page_url, headers=headers, timeout=6, allow_redirects=True)
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            # Prefer explicit mailto: links
+            for em in _MAILTO_RE.findall(html):
+                domain = em.split("@")[1].lower()
+                if domain not in _SKIP_EMAIL_DOMAINS and not em.lower().startswith("noreply"):
+                    return em.lower()
+            # Fall back to any email found in page text
+            for em in _EMAIL_RE.findall(html):
+                domain = em.split("@")[1].lower()
+                if domain not in _SKIP_EMAIL_DOMAINS and not em.lower().startswith("noreply"):
+                    return em.lower()
+        except Exception:
+            pass
+    return ""
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -229,7 +272,7 @@ def get_sheets_client():
 
 
 def load_used_contacts(ws) -> dict:
-    used = {"Pakistan": set(), "MENA": set(), "USA": set()}
+    used = {"Pakistan": set()}
     for row in ws.get_all_records():
         region = row.get("Region", "")
         ident = str(row.get("Identifier", "")).lower().strip()
@@ -242,8 +285,16 @@ def ensure_headers(ws, headers: list):
     first_row = ws.row_values(1)
     if not first_row:
         ws.append_row(headers, value_input_option="RAW")
-    elif first_row != headers:
-        log(f"[WARN] {ws.title} headers differ from expected. Current: {first_row}")
+    elif first_row == headers:
+        return
+    elif first_row == headers[:len(first_row)]:
+        # Existing headers are a prefix — just add the new columns at the end
+        extra = headers[len(first_row):]
+        col = len(first_row) + 1
+        ws.update([extra], range_name=f"R1C{col}:R1C{len(headers)}")
+        log(f"[Sheets] {ws.title}: added new columns {extra}")
+    else:
+        log(f"[WARN] {ws.title} headers differ. Expected: {headers}, current: {first_row}")
 
 
 def write_to_sheets(daily_ws, used_ws, leads: list):
@@ -311,13 +362,26 @@ def normalize_phone(phone: str) -> str:
     return re.sub(r"\D", "", phone)
 
 
+def _infer_industry(name: str, place_types: list) -> str:
+    n = name.lower()
+    if any(w in n for w in ["shoe", "footwear", "sneaker", "sandal", "boot"]):
+        return "Footwear"
+    if any(w in n for w in ["supplement", "protein", "nutrition", "vitamin", "health", "nutra"]):
+        return "Health & Supplements"
+    if any(w in n for w in ["herbal", "organic", "natural", "hakeem", "unani", "ayur"]):
+        return "Herbal & Organic"
+    if any(w in n for w in ["cosmetic", "skincare", "beauty", "makeup", "hair", "skin"]):
+        return "Beauty & Personal Care"
+    return "Apparel & Fashion"
+
+
 def fetch_pk_leads(used_phones: set, target: int, icp_text: str) -> list:
     api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
     if not api_key:
         log("[Maps] GOOGLE_MAPS_API_KEY not set — skipping Pakistan leads.")
         return []
 
-    queries = random.sample(PK_QUERIES, min(5, len(PK_QUERIES)))
+    queries = random.sample(PK_QUERIES, min(8, len(PK_QUERIES)))
     log(f"[Maps] Today's queries: {queries}")
 
     candidates = []
@@ -352,16 +416,20 @@ def fetch_pk_leads(used_phones: set, target: int, icp_text: str) -> list:
             continue
 
         used_phones.add(phone_norm)
+        website = detail.get("website", "")
+        email = _extract_email_from_website(website)
+        # Derive industry from the query that surfaced this place
+        industry = _infer_industry(place.get("name", ""), place.get("types", []))
         lead = {
             "Company": place.get("name", ""),
-            "Industry": "Apparel & Fashion",
+            "Industry": industry,
             "EmployeeEstimate": "",
             "Country": "Pakistan",
             "SupportChannel": "",
             "ContactName": "",
             "ContactRole": "",
             "LinkedIn": "",
-            "Email": "",
+            "Email": email,
             "Phone": phone_raw,
             "LeadSource": "GoogleMaps",
             "FitGrade": "C",
@@ -369,129 +437,12 @@ def fetch_pk_leads(used_phones: set, target: int, icp_text: str) -> list:
             "DateAdded": str(date.today()),
             "Status": "New",
             "Note": "",
+            "Website": website,
             "_identifier": phone_norm,
             "_region": "Pakistan",
         }
         lead["Note"] = generate_note(lead, icp_text)
         leads.append(lead)
-
-    return leads
-
-
-# ── MENA / USA: Apollo.io People Search ──────────────────────────────────────
-
-def _apollo_fit_grade(title: str) -> str:
-    t = title.lower()
-    if any(w in t for w in ["ceo", "chief executive", "founder", "co-founder", "owner", "coo", "chief operating"]):
-        return "A"
-    if any(w in t for w in ["director", "vp", "vice president", "head of"]):
-        return "A"
-    return "B"
-
-
-def _apollo_phone(person: dict) -> str:
-    phones = person.get("phone_numbers") or []
-    if not phones:
-        return ""
-    p = phones[0]
-    if isinstance(p, dict):
-        return p.get("sanitized_number") or p.get("raw_number", "")
-    return str(p)
-
-
-def fetch_apollo_leads(
-    region: str,
-    locations: list,
-    used_emails: set,
-    target: int,
-    icp_text: str,
-) -> list:
-    api_key = os.environ.get("APOLLO_API_KEY", "")
-    if not api_key:
-        log(f"[Apollo] APOLLO_API_KEY not set — skipping {region} leads.")
-        return []
-
-    leads = []
-    page = 1
-    per_page = min(target * 3, 100)
-
-    while len(leads) < target and page <= 3:
-        payload = {
-            "page": page,
-            "per_page": per_page,
-            "person_seniorities": APOLLO_SENIORITIES,
-            "organization_num_employees_ranges": ["51,200"],
-            "organization_industry_tag_names": APOLLO_INDUSTRIES,
-            "organization_locations": locations,
-            "contact_email_status": ["verified", "likely to engage", "unverified"],
-        }
-
-        try:
-            resp = requests.post(
-                APOLLO_SEARCH_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Cache-Control": "no-cache",
-                    "accept": "application/json",
-                    "X-Api-Key": api_key,
-                },
-                json=payload,
-                timeout=30,
-            )
-        except Exception as e:
-            log(f"[Apollo] {region} request error: {e}")
-            break
-
-        if resp.status_code != 200:
-            log(f"[Apollo] {region} HTTP {resp.status_code}: {resp.text[:300]}")
-            break
-
-        data = resp.json()
-        people = data.get("people", [])
-        log(f"[Apollo] {region} page {page}: {len(people)} people returned")
-
-        if not people:
-            break
-
-        for person in people:
-            if len(leads) >= target:
-                break
-
-            email = (person.get("email") or "").lower().strip()
-            if not email or email in used_emails:
-                continue
-
-            org = person.get("organization") or {}
-            job_title = (person.get("title") or "").strip()
-            used_emails.add(email)
-
-            lead = {
-                "Company": org.get("name", ""),
-                "Industry": org.get("industry", "Apparel & Fashion"),
-                "EmployeeEstimate": str(org.get("estimated_num_employees", "51-200")),
-                "Country": (person.get("country") or org.get("country", "")).title(),
-                "SupportChannel": "",
-                "ContactName": person.get("name", ""),
-                "ContactRole": job_title.title(),
-                "LinkedIn": person.get("linkedin_url") or "",
-                "Email": email,
-                "Phone": _apollo_phone(person),
-                "LeadSource": "Apollo",
-                "FitGrade": _apollo_fit_grade(job_title),
-                "IntentScore": 0,
-                "DateAdded": str(date.today()),
-                "Status": "New",
-                "Note": "",
-                "_identifier": email,
-                "_region": region,
-            }
-            lead["Note"] = generate_note(lead, icp_text)
-            leads.append(lead)
-
-        pagination = data.get("pagination", {})
-        if page >= pagination.get("total_pages", 1):
-            break
-        page += 1
 
     return leads
 
@@ -528,23 +479,12 @@ def main():
     ensure_headers(used_ws, USED_CONTACTS_HEADERS)
 
     used = load_used_contacts(used_ws)
-    log(
-        f"UsedContacts loaded: {len(used['Pakistan'])} PK | "
-        f"{len(used['MENA'])} MENA | {len(used['USA'])} USA"
-    )
+    log(f"UsedContacts loaded: {len(used['Pakistan'])} PK deduped")
 
-    # Fetch leads from each source
-    pk_leads = fetch_pk_leads(used["Pakistan"], PK_TARGET, icp_text)
-    log(f"Pakistan: {len(pk_leads)}/{PK_TARGET}")
+    all_leads = fetch_pk_leads(used["Pakistan"], PK_TARGET, icp_text)
+    log(f"Pakistan: {len(all_leads)}/{PK_TARGET}")
 
-    mena_leads = fetch_apollo_leads("MENA", MENA_LOCATIONS, used["MENA"], MENA_TARGET, icp_text)
-    log(f"MENA: {len(mena_leads)}/{MENA_TARGET}")
-
-    usa_leads = fetch_apollo_leads("USA", USA_LOCATIONS, used["USA"], USA_TARGET, icp_text)
-    log(f"USA: {len(usa_leads)}/{USA_TARGET}")
-
-    all_leads = pk_leads + mena_leads + usa_leads
-    log(f"Total: {len(all_leads)}/50")
+    log(f"Total: {len(all_leads)}/30")
 
     if dry_run:
         log("\n[DRY RUN] Sample output (first 3 leads):")
