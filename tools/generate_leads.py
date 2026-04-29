@@ -417,7 +417,6 @@ def fetch_apollo_leads(
 
     while len(leads) < target and page <= 3:
         payload = {
-            "api_key": api_key,
             "page": page,
             "per_page": per_page,
             "person_seniorities": APOLLO_SENIORITIES,
@@ -434,6 +433,7 @@ def fetch_apollo_leads(
                     "Content-Type": "application/json",
                     "Cache-Control": "no-cache",
                     "accept": "application/json",
+                    "X-Api-Key": api_key,
                 },
                 json=payload,
                 timeout=30,
