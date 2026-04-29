@@ -282,13 +282,16 @@ def load_used_contacts(ws) -> dict:
 
 
 def ensure_headers(ws, headers: list):
+    # Expand the grid if the sheet has fewer columns than our schema needs
+    if ws.col_count < len(headers):
+        ws.resize(rows=ws.row_count, cols=len(headers))
     first_row = ws.row_values(1)
     if not first_row:
         ws.append_row(headers, value_input_option="RAW")
     elif first_row == headers:
         return
     elif first_row == headers[:len(first_row)]:
-        # Existing headers are a prefix — just add the new columns at the end
+        # Existing headers are a prefix — append the new column names
         extra = headers[len(first_row):]
         col = len(first_row) + 1
         ws.update([extra], range_name=f"R1C{col}:R1C{len(headers)}")
