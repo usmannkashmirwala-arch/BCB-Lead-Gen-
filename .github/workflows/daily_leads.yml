@@ -12,11 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Node.js is pre-installed on ubuntu-latest; install vpai CLI globally
-      # to avoid npx download overhead on every run
-      - name: Install vpai CLI
-        run: npm install -g @vibeprospecting/vpai@latest
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -29,6 +24,6 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          VIBEPROSPECTING_API_KEY: ${{ secrets.VIBEPROSPECTING_API_KEY }}
+          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
         run: python tools/generate_leads.py

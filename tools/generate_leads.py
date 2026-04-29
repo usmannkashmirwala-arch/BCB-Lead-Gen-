@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily lead generation pipeline for Better Call Bot.
-Generates 50 leads/day: 30 Pakistan (Google Maps), 10 MENA + 10 USA (Vibe Prospecting).
+Generates 50 leads/day: 30 Pakistan (Google Maps), 10 MENA + 10 USA (Apollo.io).
 Appends to Google Sheets: DailyLeads and UsedContacts (dedup registry).
 
 ICP context is loaded at startup from Lead Details/BCB ICP and Offer.pdf
@@ -16,7 +16,6 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import time
 from datetime import date
@@ -69,12 +68,12 @@ PK_QUERIES = [
     "fashion clothing Sargodha",
 ]
 
-# ── Vibe Prospecting config ───────────────────────────────────────────────────
-VIBE_JOB_LEVELS = ["c-suite", "founder", "owner", "director", "vice president"]
-VIBE_DEPARTMENTS = ["c-suite", "operations", "customer success", "support"]
-VIBE_LINKEDIN_CATEGORIES = ["Apparel & Fashion", "Retail", "Consumer Goods"]
-MENA_COUNTRY_CODES = ["AE", "SA", "QA", "KW"]
-USA_COUNTRY_CODES = ["US"]
+# ── Apollo.io config ─────────────────────────────────────────────────────────
+APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
+APOLLO_SENIORITIES = ["owner", "founder", "c_suite", "vp", "director"]
+APOLLO_INDUSTRIES = ["Apparel & Fashion", "Retail", "Consumer Goods"]
+MENA_LOCATIONS = ["United Arab Emirates", "Saudi Arabia", "Qatar", "Kuwait"]
+USA_LOCATIONS = ["United States"]
 
 # ── Google Maps config ────────────────────────────────────────────────────────
 MAPS_BASE = "https://maps.googleapis.com/maps/api/place"
@@ -379,203 +378,120 @@ def fetch_pk_leads(used_phones: set, target: int, icp_text: str) -> list:
     return leads
 
 
-# ── MENA / USA: Vibe Prospecting (vpai CLI) ───────────────────────────────────
+# ── MENA / USA: Apollo.io People Search ──────────────────────────────────────
 
-def _vpai(tool: str, args: dict) -> dict:
-    """Call the vpai CLI via subprocess and return parsed JSON output."""
-    vp_key = os.environ.get("VIBEPROSPECTING_API_KEY", os.environ.get("VP_API_KEY", ""))
-    if not vp_key:
-        log("[vpai] VIBEPROSPECTING_API_KEY not set")
-        return {}
-
-    reasoning = args.get("tool_reasoning", f"Lead generation via {tool}")
-    env = {**os.environ, "VP_API_KEY": vp_key}
-
-    cmd = [
-        "npx", "--yes", "@vibeprospecting/vpai@latest", tool,
-        "--args", json.dumps(args),
-        "--tool-reasoning", reasoning,
-    ]
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
-    except subprocess.TimeoutExpired:
-        log(f"[vpai] Timeout running {tool}")
-        return {}
-
-    # stderr has npm notices; only log actual errors
-    if proc.stderr:
-        err_lines = [l for l in proc.stderr.splitlines() if '"level":"error"' in l]
-        if err_lines:
-            log(f"[vpai] Errors: {err_lines[0][:200]}")
-
-    if not proc.stdout.strip():
-        log(f"[vpai] Empty output from {tool}")
-        return {}
-
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        log(f"[vpai] JSON parse error ({tool}): {e} — raw: {proc.stdout[:200]}")
-        return {}
-
-
-def _parse_enrich_contacts(result: dict) -> dict:
-    """
-    Parse enrich-prospects response.
-    Returns {prospect_id: {"email": str, "phone": str}}.
-    """
-    contacts_str = result.get("enrichment_results", {}).get("contacts", "")
-    if not contacts_str:
-        return {}
-    try:
-        contacts_data = json.loads(contacts_str)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-    out = {}
-    for item in contacts_data.get("data", []):
-        pid = item.get("prospect_id", "")
-        data = item.get("data", {}) or {}
-
-        # Prefer current professional email
-        email = data.get("professions_email", "")
-        if not email:
-            for em in data.get("emails") or []:
-                if em.get("type") == "current_professional":
-                    email = em.get("address", "")
-                    break
-        if not email:
-            emails = data.get("emails") or []
-            email = emails[0].get("address", "") if emails else ""
-
-        phone = data.get("mobile_phone", "") or ""
-        if not phone:
-            nums = data.get("phone_numbers") or []
-            if nums:
-                phone = nums[0] if isinstance(nums[0], str) else nums[0].get("raw_number", "")
-
-        if pid:
-            out[pid] = {"email": email or "", "phone": phone or ""}
-    return out
-
-
-def _clean_linkedin(url: str) -> str:
-    if not url:
-        return ""
-    url = url.strip()
-    if url.startswith("http"):
-        return url
-    return f"https://www.{url}" if url.startswith("linkedin.com") else url
-
-
-def _fit_grade(job_levels: list) -> str:
-    decision_maker_levels = {"c-suite", "founder", "owner", "director", "vice president"}
-    if any(level in decision_maker_levels for level in job_levels):
+def _apollo_fit_grade(title: str) -> str:
+    t = title.lower()
+    if any(w in t for w in ["ceo", "chief executive", "founder", "co-founder", "owner", "coo", "chief operating"]):
+        return "A"
+    if any(w in t for w in ["director", "vp", "vice president", "head of"]):
         return "A"
     return "B"
 
 
-def fetch_vibe_leads(
+def _apollo_phone(person: dict) -> str:
+    phones = person.get("phone_numbers") or []
+    if not phones:
+        return ""
+    p = phones[0]
+    if isinstance(p, dict):
+        return p.get("sanitized_number") or p.get("raw_number", "")
+    return str(p)
+
+
+def fetch_apollo_leads(
     region: str,
-    country_codes: list,
+    locations: list,
     used_emails: set,
     target: int,
     icp_text: str,
 ) -> list:
-    vp_key = os.environ.get("VIBEPROSPECTING_API_KEY", os.environ.get("VP_API_KEY", ""))
-    if not vp_key:
-        log(f"[vpai] VIBEPROSPECTING_API_KEY not set — skipping {region} leads.")
+    api_key = os.environ.get("APOLLO_API_KEY", "")
+    if not api_key:
+        log(f"[Apollo] APOLLO_API_KEY not set — skipping {region} leads.")
         return []
 
-    fetch_size = target * 3  # over-fetch to account for missing emails and dupes
-    reasoning = (
-        f"Find decision makers at apparel and fashion e-commerce companies "
-        f"in {region} for AI customer support agent outreach"
-    )
-
-    # Step 1: fetch prospect list
-    fetch_args = {
-        "entity_type": "prospects",
-        "filters": {
-            "company_size": {"values": ["51-200"]},
-            "linkedin_category": {"values": VIBE_LINKEDIN_CATEGORIES},
-            "company_country_code": {"values": country_codes},
-            "job_level": {"values": VIBE_JOB_LEVELS},
-            "job_department": {"values": VIBE_DEPARTMENTS},
-            "has_email": True,
-        },
-        "page_size": fetch_size,
-        "tool_reasoning": reasoning,
-    }
-
-    log(f"[vpai] {region}: fetching up to {fetch_size} candidates from {country_codes}")
-    fetch_result = _vpai("fetch-entities", fetch_args)
-    prospects = fetch_result.get("data", [])
-    log(f"[vpai] {region}: {len(prospects)} candidates returned")
-
-    if not prospects:
-        return []
-
-    # Step 2: enrich to get actual emails (batch up to 100 per call)
-    prospect_ids = [p["prospect_id"] for p in prospects if p.get("prospect_id")]
-    enrich_args = {
-        "prospect_ids": prospect_ids[:100],
-        "enrichments": ["contacts"],
-        "tool_reasoning": reasoning,
-    }
-    log(f"[vpai] {region}: enriching {len(prospect_ids[:100])} prospects for contact details")
-    enrich_result = _vpai("enrich-prospects", enrich_args)
-    # Detect plain-text error messages returned inside the contacts field
-    contacts_raw = enrich_result.get("enrichment_results", {}).get("contacts", "")
-    if isinstance(contacts_raw, str) and contacts_raw and not contacts_raw.strip().startswith("{"):
-        log(f"[vpai] {region}: enrich returned an error — {contacts_raw[:300]}")
-    contact_map = _parse_enrich_contacts(enrich_result)
-    log(f"[vpai] {region}: got contact data for {len(contact_map)} prospects")
-
-    # Step 3: build leads, filtering dupes
-    id_to_prospect = {p["prospect_id"]: p for p in prospects}
     leads = []
+    page = 1
+    per_page = min(target * 3, 100)
 
-    for pid, contacts in contact_map.items():
-        if len(leads) >= target:
+    while len(leads) < target and page <= 3:
+        payload = {
+            "api_key": api_key,
+            "page": page,
+            "per_page": per_page,
+            "person_seniorities": APOLLO_SENIORITIES,
+            "organization_num_employees_ranges": ["51,200"],
+            "organization_industry_tag_names": APOLLO_INDUSTRIES,
+            "organization_locations": locations,
+            "contact_email_status": ["verified", "likely to engage", "unverified"],
+        }
+
+        try:
+            resp = requests.post(
+                APOLLO_SEARCH_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-cache",
+                    "accept": "application/json",
+                },
+                json=payload,
+                timeout=30,
+            )
+        except Exception as e:
+            log(f"[Apollo] {region} request error: {e}")
             break
 
-        email = contacts.get("email", "").lower().strip()
-        if not email or email in used_emails:
-            continue
+        if resp.status_code != 200:
+            log(f"[Apollo] {region} HTTP {resp.status_code}: {resp.text[:300]}")
+            break
 
-        person = id_to_prospect.get(pid, {})
+        data = resp.json()
+        people = data.get("people", [])
+        log(f"[Apollo] {region} page {page}: {len(people)} people returned")
 
-        # Pick the cleanest LinkedIn URL (vanity slug preferred over obfuscated ID)
-        li_urls = person.get("linkedin_url_array") or []
-        linkedin = _clean_linkedin(li_urls[-1] if li_urls else person.get("linkedin", ""))
+        if not people:
+            break
 
-        job_levels = person.get("job_level_array") or []
-        used_emails.add(email)
+        for person in people:
+            if len(leads) >= target:
+                break
 
-        lead = {
-            "Company": person.get("company_name", ""),
-            "Industry": "Apparel & Fashion",
-            "EmployeeEstimate": "51-200",
-            "Country": person.get("country_name", "").title(),
-            "SupportChannel": "",
-            "ContactName": person.get("full_name", ""),
-            "ContactRole": person.get("job_title", "").title(),
-            "LinkedIn": linkedin,
-            "Email": email,
-            "Phone": contacts.get("phone", ""),
-            "LeadSource": "VibeProspecting",
-            "FitGrade": _fit_grade(job_levels),
-            "IntentScore": 0,
-            "DateAdded": str(date.today()),
-            "Status": "New",
-            "Note": "",
-            "_identifier": email,
-            "_region": region,
-        }
-        lead["Note"] = generate_note(lead, icp_text)
-        leads.append(lead)
+            email = (person.get("email") or "").lower().strip()
+            if not email or email in used_emails:
+                continue
+
+            org = person.get("organization") or {}
+            job_title = (person.get("title") or "").strip()
+            used_emails.add(email)
+
+            lead = {
+                "Company": org.get("name", ""),
+                "Industry": org.get("industry", "Apparel & Fashion"),
+                "EmployeeEstimate": str(org.get("estimated_num_employees", "51-200")),
+                "Country": (person.get("country") or org.get("country", "")).title(),
+                "SupportChannel": "",
+                "ContactName": person.get("name", ""),
+                "ContactRole": job_title.title(),
+                "LinkedIn": person.get("linkedin_url") or "",
+                "Email": email,
+                "Phone": _apollo_phone(person),
+                "LeadSource": "Apollo",
+                "FitGrade": _apollo_fit_grade(job_title),
+                "IntentScore": 0,
+                "DateAdded": str(date.today()),
+                "Status": "New",
+                "Note": "",
+                "_identifier": email,
+                "_region": region,
+            }
+            lead["Note"] = generate_note(lead, icp_text)
+            leads.append(lead)
+
+        pagination = data.get("pagination", {})
+        if page >= pagination.get("total_pages", 1):
+            break
+        page += 1
 
     return leads
 
@@ -621,10 +537,10 @@ def main():
     pk_leads = fetch_pk_leads(used["Pakistan"], PK_TARGET, icp_text)
     log(f"Pakistan: {len(pk_leads)}/{PK_TARGET}")
 
-    mena_leads = fetch_vibe_leads("MENA", MENA_COUNTRY_CODES, used["MENA"], MENA_TARGET, icp_text)
+    mena_leads = fetch_apollo_leads("MENA", MENA_LOCATIONS, used["MENA"], MENA_TARGET, icp_text)
     log(f"MENA: {len(mena_leads)}/{MENA_TARGET}")
 
-    usa_leads = fetch_vibe_leads("USA", USA_COUNTRY_CODES, used["USA"], USA_TARGET, icp_text)
+    usa_leads = fetch_apollo_leads("USA", USA_LOCATIONS, used["USA"], USA_TARGET, icp_text)
     log(f"USA: {len(usa_leads)}/{USA_TARGET}")
 
     all_leads = pk_leads + mena_leads + usa_leads
