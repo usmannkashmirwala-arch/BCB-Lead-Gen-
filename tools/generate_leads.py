@@ -590,8 +590,19 @@ def main():
     gc = get_sheets_client()
     sheet_id = os.environ["GOOGLE_SHEET_ID"]
     wb = gc.open_by_key(sheet_id)
-    daily_ws = wb.worksheet(DAILY_LEADS_SHEET)
-    used_ws = wb.worksheet(USED_CONTACTS_SHEET)
+
+    existing_titles = {ws.title for ws in wb.worksheets()}
+    if DAILY_LEADS_SHEET not in existing_titles:
+        log(f"[Sheets] Creating tab '{DAILY_LEADS_SHEET}'")
+        daily_ws = wb.add_worksheet(title=DAILY_LEADS_SHEET, rows=5000, cols=len(DAILY_LEADS_HEADERS))
+    else:
+        daily_ws = wb.worksheet(DAILY_LEADS_SHEET)
+
+    if USED_CONTACTS_SHEET not in existing_titles:
+        log(f"[Sheets] Creating tab '{USED_CONTACTS_SHEET}'")
+        used_ws = wb.add_worksheet(title=USED_CONTACTS_SHEET, rows=50000, cols=len(USED_CONTACTS_HEADERS))
+    else:
+        used_ws = wb.worksheet(USED_CONTACTS_SHEET)
 
     ensure_headers(daily_ws, DAILY_LEADS_HEADERS)
     ensure_headers(used_ws, USED_CONTACTS_HEADERS)
